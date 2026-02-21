@@ -1,7 +1,6 @@
 import glob
 import math
 import os
-import random
 import subprocess
 import tkinter as tk
 from dataclasses import dataclass
@@ -17,14 +16,15 @@ from PIL import Image, ImageTk
 import shutil
 import time
 
-
 CAMERA_WINDOW = "Camera"
-VIDEOS_DIR_V2 = "videos_2"
-EMPTY_VIDEO_BASENAME = "empty"
+VIDEOS_DIR = "videos"
 
 HEAD_TURN_THRESHOLD_DEG = 20.0
 GAZE_TURN_THRESHOLD_DEG = 20.0
-INATTENTIVE_THRESHOLD_FRAMES = 10
+FRAME_JITTER_THRESHOLD = 5
+
+
+num_distracted = 0
 
 
 FACE_LANDMARK_IDS = [33, 263, 1, 61, 291, 199]
@@ -62,7 +62,7 @@ class GazeDirection:
 
 class FaceOrientationEstimator:
     def __init__(self) -> None:
-        base_options = python.BaseOptions(model_asset_path="face_landmarker.task")
+        base_options = python.BaseOptions(model_asset_path='face_landmarker.task')
         options = vision.FaceLandmarkerOptions(
             base_options=base_options,
             running_mode=vision.RunningMode.VIDEO,
@@ -75,12 +75,11 @@ class FaceOrientationEstimator:
         self._frame_counter = 0
 
     def process(self, frame_bgr: np.ndarray) -> Optional[Any]:
-        rgb_image = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
         self._frame_counter += 1
         timestamp_ms = self._frame_counter * 33
         result = self._landmarker.detect_for_video(mp_image, timestamp_ms)
-
+        
         if result.face_landmarks and len(result.face_landmarks) > 0:
             return result.face_landmarks[0]
         return None
@@ -205,41 +204,47 @@ class GazeEstimator:
         return GazeDirection(horizontal=horizontal_deg, vertical=vertical_deg)
 
 
-class AttentionTrigger:
-    def __init__(self, threshold: int) -> None:
-        self.threshold = threshold
-        self._inattentive_streak = 0
-        self._triggered_since_reset = False
+class AttentionState:
+    def __init__(self) -> None:
+        self.out_counter = 0
+        self.in_counter = 0
+        self.is_attentive = True
 
-    def update(self, attentive: bool) -> bool:
-        if attentive:
-            self._inattentive_streak = 0
-            self._triggered_since_reset = False
-            return False
+    def update(self, is_attentive: bool) -> Tuple[bool, bool]:
+        if is_attentive:
+            self.in_counter += 1
+            self.out_counter = 0
+        else:
+            self.out_counter += 1
+            self.in_counter = 0
 
-        self._inattentive_streak += 1
-        if self._inattentive_streak >= self.threshold and not self._triggered_since_reset:
-            self._triggered_since_reset = True
-            return True
-        return False
+        became_inattentive = False
+        became_attentive = False
+
+        if self.out_counter >= FRAME_JITTER_THRESHOLD and self.is_attentive:
+            self.is_attentive = False
+            became_inattentive = True
+        elif self.in_counter >= FRAME_JITTER_THRESHOLD and not self.is_attentive:
+            self.is_attentive = True
+            became_attentive = True
+
+        return became_inattentive, became_attentive
 
 
-class PersistentVideoPlayer:
+class TkinterVideoPlayer:
     def __init__(self) -> None:
         self._root = tk.Tk()
         self._root.title("Video Player")
+        self._root.withdraw()
         self._label = tk.Label(self._root)
         self._label.pack()
-
         self._capture: Optional[cv2.VideoCapture] = None
         self._current_path: Optional[str] = None
-        self._loop: bool = False
-        self._mute: bool = False
+        self._photo: Optional[ImageTk.PhotoImage] = None
         self._frame_interval_sec: float = 1.0 / 30.0
-        self._next_frame_time: float = time.perf_counter()
         self._after_id: Optional[str] = None
         self._audio_process: Optional[subprocess.Popen] = None
-        self._on_complete: Optional[callable] = None
+        self._next_frame_time: float = time.perf_counter()
 
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -252,24 +257,11 @@ class PersistentVideoPlayer:
     def is_playing(self) -> bool:
         return self._capture is not None
 
-    @property
-    def is_looping(self) -> bool:
-        return self._loop and self.is_playing
-
-    def play(
-        self,
-        path: str,
-        *,
-        fps_hint: Optional[float] = None,
-        loop: bool = False,
-        mute: bool = False,
-        on_complete: Optional[callable] = None,
-    ) -> bool:
-        self._stop_playback()
-
+    def play(self, path: str, fps_hint: Optional[float] = None) -> bool:
+        self.stop()
         capture = cv2.VideoCapture(path)
         if not capture.isOpened():
-            print(f"[PersistentVideoPlayer] Failed to open video: {path}")
+            print(f"[TkinterVideoPlayer] Failed to open video: {path}")
             return False
 
         fps = fps_hint
@@ -277,35 +269,49 @@ class PersistentVideoPlayer:
             fps = capture.get(cv2.CAP_PROP_FPS)
         if not fps or not math.isfinite(fps) or fps <= 1e-3:
             fps = 30.0
-
+            print("USING DEFAULT")
+        print(fps)
         self._frame_interval_sec = max(1.0 / fps, 1.0 / 120.0)
         self._next_frame_time = time.perf_counter() + self._frame_interval_sec
 
         self._capture = capture
         self._current_path = path
-        self._loop = loop
-        self._mute = mute
-        self._on_complete = on_complete
-
-        if mute:
-            self._stop_audio()
-        else:
-            self._start_audio(path)
-
         self._root.deiconify()
         self._root.lift()
+
+        self._start_audio(path)
         self._schedule_next_frame()
         return True
+
+    def stop(self) -> None:
+        if self._after_id is not None:
+            try:
+                self._root.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
+            self._after_id = None
+
+        if self._capture is not None:
+            self._capture.release()
+            self._capture = None
+
+        self._stop_audio()
+
+        self._current_path = None
+        self._label.configure(image="")
+        self._label.image = None
+        self._photo = None
+        self._root.withdraw()
 
     def process_events(self) -> None:
         try:
             self._root.update_idletasks()
             self._root.update()
         except tk.TclError:
-            self.destroy()
+            self.stop()
 
     def destroy(self) -> None:
-        self._stop_playback()
+        self.stop()
         try:
             self._root.destroy()
         except tk.TclError:
@@ -323,96 +329,49 @@ class PersistentVideoPlayer:
             return
 
         now = time.perf_counter()
-        while self._capture is not None and now > self._next_frame_time + self._frame_interval_sec:
-            if not self._capture.grab():
-                if self._loop:
-                    if not self._restart_capture():
-                        self._finish_playback()
-                        return
-                    self._next_frame_time = time.perf_counter()
-                    now = self._next_frame_time
-                    continue
-                self._finish_playback()
-                return
-            self._next_frame_time += self._frame_interval_sec
-            now = time.perf_counter()
+        if now > self._next_frame_time + self._frame_interval_sec:
+            behind = now - self._next_frame_time
+            frames_to_skip = min(int(behind / self._frame_interval_sec), 30)
+            for _ in range(frames_to_skip):
+                if not self._capture.grab():
+                    self.stop()
+                    return
+            self._next_frame_time = now
 
         ret, frame = self._capture.read()
         if not ret:
-            if self._loop:
-                if not self._restart_capture():
-                    return
-                self._next_frame_time = time.perf_counter()
-                ret, frame = self._capture.read()
-                if not ret:
-                    return
-            else:
-                self._finish_playback()
-                return
+            self.stop()
+            return
 
         photo = self._frame_to_photo_image(frame)
         if photo is None:
-            self._finish_playback()
+            self.stop()
             return
 
+        self._photo = photo
         self._label.configure(image=photo)
         self._label.image = photo
 
         display_time = time.perf_counter()
-        self._next_frame_time += self._frame_interval_sec
         if self._next_frame_time <= display_time:
             self._next_frame_time = display_time + self._frame_interval_sec
+        else:
+            self._next_frame_time += self._frame_interval_sec
         self._schedule_next_frame()
 
-    def _finish_playback(self) -> None:
-        callback = self._on_complete
-        if callback is not None:
-            self._on_complete = None
-        self._stop_playback()
-        if callback is not None:
-            callback()
-
-    def _stop_playback(self) -> None:
-        if self._after_id is not None:
-            try:
-                self._root.after_cancel(self._after_id)
-            except tk.TclError:
-                pass
-            self._after_id = None
-
-        if self._capture is not None:
-            self._capture.release()
-            self._capture = None
-
-        self._stop_audio()
-        self._label.configure(image="")
-        self._label.image = None
-        self._current_path = None
-        self._on_complete = None
-
-    def _restart_capture(self) -> bool:
-        if self._current_path is None:
-            return False
-        try:
-            self._capture.release()
-        except Exception:
-            pass
-        self._capture = cv2.VideoCapture(self._current_path)
-        return self._capture.isOpened()
-
     def _on_close(self) -> None:
-        self.destroy()
+        self.stop()
 
     @staticmethod
     def _frame_to_photo_image(frame: np.ndarray) -> Optional[ImageTk.PhotoImage]:
         height, width = frame.shape[:2]
-        resized_frame = cv2.resize(frame, (max(int(width / 1.5), 1), max(int(height / 1.5), 1)))
+        resized_frame = cv2.resize(frame, (width // 3, height // 3))
         frame_rgb = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(frame_rgb)
         try:
             return ImageTk.PhotoImage(image=image)
         except tk.TclError as exc:
-            print(f"[PersistentVideoPlayer] Unable to display frame: {exc}")
+            print(f"[TkinterVideoPlayer] Unable to display frame: {exc}")
             return None
 
     def _start_audio(self, path: str) -> None:
@@ -441,67 +400,38 @@ class PersistentVideoPlayer:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            self._audio_process = proc
+            return True
         except Exception as exc:
-            print(f"[PersistentVideoPlayer] Failed to start ffplay audio: {exc}")
+            print(f"[TkinterVideoPlayer] Failed to start ffplay audio: {exc}")
             return False
-        self._audio_process = proc
-        return True
 
     def _launch_afplay(self, path: str) -> None:
         if shutil.which("afplay") is None:
-            print("[PersistentVideoPlayer] No audio player available; audio disabled")
+            print("[TkinterVideoPlayer] No audio player available; audio disabled")
             self._audio_process = None
             return
         try:
             self._audio_process = subprocess.Popen(["afplay", path])
         except Exception as exc:
-            print(f"[PersistentVideoPlayer] Failed to start afplay audio: {exc}")
+            print(f"[TkinterVideoPlayer] Failed to start afplay audio: {exc}")
             self._audio_process = None
 
 
-class VideoManagerV2:
-    def __init__(self, directory: str, empty_basename: str) -> None:
+class VideoManager:
+    def __init__(self, directory: str) -> None:
         self.directory = directory
         self.video_entries: List[Tuple[str, Optional[float]]] = self._load_video_entries(directory)
-        self.empty_entry = self._find_empty_entry(empty_basename)
-        if self.empty_entry is None:
-            raise FileNotFoundError(f"Empty video with basename '{empty_basename}' not found in {directory}")
+        self.current_path: Optional[str] = None
+        self._player = TkinterVideoPlayer()
 
-        self.random_entries = [entry for entry in self.video_entries if entry != self.empty_entry]
-        self._player = PersistentVideoPlayer()
-        self._mode: str = "empty"
-        self.loop_empty()
-
-    def can_trigger_new_video(self) -> bool:
-        return self._mode == "empty" and bool(self.random_entries)
-
-    def play_random_video(self) -> None:
-        if not self.random_entries:
-            print("[VideoManagerV2] No non-empty videos available.")
-            return
-        path, fps = random.choice(self.random_entries)
-        if self._player.play(path, fps_hint=fps, loop=False, mute=False, on_complete=self.loop_empty):
-            self._mode = "content"
-            print(f"[VideoManagerV2] Playing content video: {path}")
-
-    def loop_empty(self) -> None:
-        path, fps = self.empty_entry
-        if self._player.play(path, fps_hint=fps, loop=True, mute=True, on_complete=None):
-            self._mode = "empty"
-            print(f"[VideoManagerV2] Looping empty video: {path}")
-
-    def process_events(self) -> None:
-        self._player.process_events()
-
-    def shutdown(self) -> None:
-        self._player.destroy()
-
-    def _load_video_entries(self, directory: str) -> List[Tuple[str, Optional[float]]]:
+    @staticmethod
+    def _load_video_entries(directory: str) -> List[Tuple[str, Optional[float]]]:
         patterns = ["*.mp4", "*.mov", "*.avi", "*.mkv"]
         videos: List[Tuple[str, Optional[float]]] = []
         for pattern in patterns:
             for path in sorted(glob.glob(os.path.join(directory, pattern))):
-                videos.append((path, self._read_fps(path)))
+                videos.append((path, VideoManager._read_fps(path)))
         return videos
 
     @staticmethod
@@ -515,13 +445,42 @@ class VideoManagerV2:
             return None
         return float(fps)
 
-    def _find_empty_entry(self, basename: str) -> Optional[Tuple[str, Optional[float]]]:
-        target = basename.lower()
-        for path, fps in self.video_entries:
-            name = os.path.splitext(os.path.basename(path))[0].lower()
-            if name == target:
-                return (path, fps)
-        return None
+    @property
+    def is_playing(self) -> bool:
+        return self._player.is_playing
+
+    def start_random_video(self) -> None:
+        global num_distracted
+        if not self.video_entries:
+            print("[VideoManager] No videos found in directory:", self.directory)
+            return
+
+        index = num_distracted % len(self.video_entries)
+        path, fps = self.video_entries[index]
+        self.stop_video()
+
+        if self._player.play(path, fps_hint=fps):
+            self.current_path = path
+            num_distracted += 1
+            print(f"[VideoManager] Playing video: {path}")
+        else:
+            self.current_path = None
+
+    def stop_video(self) -> None:
+        if self._player.is_playing:
+            self._player.stop()
+        self.current_path = None
+
+    def update(self, inattentive: bool) -> None:
+        was_playing = self.is_playing
+        self._player.process_events()
+
+        if was_playing and not self.is_playing and inattentive:
+            self.start_random_video()
+
+    def shutdown(self) -> None:
+        self.stop_video()
+        self._player.destroy()
 
 
 def attention_check(head_pose: Optional[HeadPose], gaze: Optional[GazeDirection]) -> bool:
@@ -530,7 +489,7 @@ def attention_check(head_pose: Optional[HeadPose], gaze: Optional[GazeDirection]
 
     if abs(head_pose.yaw) > HEAD_TURN_THRESHOLD_DEG:
         return False
-    if abs(head_pose.pitch - 40) > HEAD_TURN_THRESHOLD_DEG:
+    if abs(head_pose.pitch-30) > HEAD_TURN_THRESHOLD_DEG:
         return False
     if abs(gaze.horizontal) > GAZE_TURN_THRESHOLD_DEG:
         return False
@@ -539,20 +498,14 @@ def attention_check(head_pose: Optional[HeadPose], gaze: Optional[GazeDirection]
     return True
 
 
-def annotate_frame(
-    frame: np.ndarray,
-    landmarks: Any,
-    head_pose: Optional[HeadPose],
-    gaze: Optional[GazeDirection],
-    attentive: bool,
-) -> None:
+def annotate_frame(frame: np.ndarray, landmarks: Any, head_pose: Optional[HeadPose], gaze: Optional[GazeDirection], attentive: bool) -> None:
     if landmarks is not None:
         height, width, _ = frame.shape
         for lm in landmarks:
             x = int(lm.x * width)
             y = int(lm.y * height)
             cv2.circle(frame, (x, y), 1, (0, 255, 0), -1)
-
+    
     status_text = "ATTENTIVE" if attentive else "DISTRACTED"
     color = (0, 200, 0) if attentive else (0, 0, 255)
     cv2.putText(frame, status_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.1, color, 2)
@@ -580,9 +533,9 @@ def annotate_frame(
 
 
 def main() -> None:
-    video_manager = VideoManagerV2(VIDEOS_DIR_V2, EMPTY_VIDEO_BASENAME)
+    video_manager = VideoManager(VIDEOS_DIR)
     face_estimator = FaceOrientationEstimator()
-    attention_trigger = AttentionTrigger(INATTENTIVE_THRESHOLD_FRAMES)
+    attention_state = AttentionState()
 
     capture = cv2.VideoCapture(0)
     if not capture.isOpened():
@@ -599,11 +552,11 @@ def main() -> None:
 
     cv2.namedWindow(CAMERA_WINDOW, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(CAMERA_WINDOW, camera_width, camera_height)
-
+    
     temp_root = tk.Tk()
     screen_width = temp_root.winfo_screenwidth()
     temp_root.destroy()
-
+    
     camera_x = int(screen_width * 0.55)
     camera_y = 100
     cv2.moveWindow(CAMERA_WINDOW, camera_x, camera_y)
@@ -612,7 +565,7 @@ def main() -> None:
         while True:
             ret, frame = capture.read()
             if not ret:
-                print("[Main V2] Failed to grab frame from camera")
+                print("[Main] Failed to grab frame from camera")
                 break
 
             landmarks = face_estimator.process(frame)
@@ -624,17 +577,19 @@ def main() -> None:
                 gaze_direction = GazeEstimator.estimate(landmarks, frame.shape)
 
             is_attentive_now = attention_check(head_pose, gaze_direction)
-            trigger_distraction = attention_trigger.update(is_attentive_now)
+            became_inattentive, became_attentive = attention_state.update(is_attentive_now)
 
-            if trigger_distraction and video_manager.can_trigger_new_video():
-                video_manager.play_random_video()
+            if became_inattentive and not video_manager.is_playing:
+                video_manager.start_random_video()
+            if became_attentive and video_manager.is_playing:
+                video_manager.stop_video()
 
-            video_manager.process_events()
+            video_manager.update(not attention_state.is_attentive)
 
             height, width = frame.shape[:2]
             resized_frame = cv2.resize(frame, (width // 2, height // 2))
-
-            annotate_frame(resized_frame, landmarks, head_pose, gaze_direction, is_attentive_now)
+            
+            annotate_frame(resized_frame, landmarks, head_pose, gaze_direction, attention_state.is_attentive)
             cv2.imshow(CAMERA_WINDOW, resized_frame)
 
             key = cv2.waitKey(1) & 0xFF
