@@ -1,6 +1,6 @@
 # Charming Focus (Minimal Release)
 
-이 저장소에는 `/Users/jugwangjin/Desktop/charming_focus/main.py` 기반의 버전 2 구현만을 포함합니다. 비디오 자원, Mediapipe 모델, 기타 파생 스크립트는 배포 대상에 포함돼 있지 않습니다. 아래 내용을 참고해 환경을 구성하고 필요한 설정을 조정하세요.
+이 저장소에는 소스코드만 포함되어 있습니다. 비디오 자원, Mediapipe 모델, 기타 파생 스크립트는 배포 대상에 포함돼 있지 않습니다. 아래 내용을 참고해 환경을 구성하고 필요한 설정을 조정하세요.
 
 ## 준비물
 
