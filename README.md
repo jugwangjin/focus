@@ -48,3 +48,5 @@
 
 - 이 배포본에는 `main.py`만 포함돼 있으므로 비디오 자원과 Mediapipe 모델 파일은 직접 준비해야 합니다.
 - 오디오 출력을 위해 `ffplay` 또는 `afplay` 중 하나는 시스템에 설치돼 있어야 합니다.
+- 비디오는 https://youtu.be/OO14VSx74MU?si=rSXCAP5KWcD3Oce7 에서 클립을 얻었습니다
+- face_landmarker.task는 https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker?hl=ko 에서 받을 수 있습니다 
